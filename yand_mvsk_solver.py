@@ -1,11 +1,40 @@
 import argparse
+import sys
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 import os
 import pickle
 import time
 
-import akshare as ak
+
+def is_executable_file(path):
+    """Return True when *path* exists as a regular executable file.
+
+    This mirrors the POSIX shell-style executable check: directories and missing
+    paths are not executable files, while regular files must have execute
+    permission for the current process.
+    """
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def maybe_handle_executable_check(argv=None):
+    """Handle the lightweight executable-file check before optional heavy imports."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--check_executable', default=None)
+    args, _ = parser.parse_known_args(argv)
+    if args.check_executable is None:
+        return
+    if is_executable_file(args.check_executable):
+        print(f'Executable file: {args.check_executable}')
+        raise SystemExit(0)
+    print(f'Not an executable file: {args.check_executable}')
+    raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    maybe_handle_executable_check(sys.argv[1:])
+
+
 import numpy as np
 import pandas as pd
 from scipy.optimize import OptimizeResult, minimize, minimize_scalar
@@ -612,6 +641,8 @@ def normalize_code(code):
 
 def get_stock_name_map():
     """Fetch the Chinese stock code -> name mapping from akshare."""
+    import akshare as ak
+
     df = ak.stock_info_a_code_name()
     df = df.rename(columns={'code': 'code6', 'name': 'name_zh'})
     df['code6'] = df['code6'].astype(str).str.zfill(6)
@@ -1205,6 +1236,7 @@ def parse_args():
     parser.add_argument('--periods_per_year', type=int, default=11712, help='Annualization periods for 5-minute data.')
     parser.add_argument('--mode', choices=('auto', 'direct', 'large', 'householder'), default='auto', help='Optimizer mode.')
     parser.add_argument('--n_jobs', type=int, default=1, help='Parallel workers for independent MVSK c1-grid optimizations. Use 1 to disable parallelism.')
+    parser.add_argument('--check_executable', default=None, help='Path to check; exits after reporting whether it is an executable regular file.')
     return parser.parse_args()
 
 
