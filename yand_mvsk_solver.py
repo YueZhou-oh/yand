@@ -1,4 +1,7 @@
 import argparse
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+import os
 import pickle
 import time
 
@@ -815,7 +818,31 @@ def solve_mv_target(R_train, target_return):
     return _solve_mv_target_from_stats(mu, Sigma, target_return)
 
 
-def _mvsk_target_candidates(R_train, profile='kurtosis', method='yand', mode='large', max_iter=100, c1_grid=None):
+_MVSK_WORKER_CONTEXT = None
+
+
+def _init_mvsk_worker(R_train, mu, base_c2, base_c3, base_c4, method, mode, max_iter):
+    global _MVSK_WORKER_CONTEXT
+    _MVSK_WORKER_CONTEXT = (R_train, mu, base_c2, base_c3, base_c4, method, mode, max_iter)
+
+
+def _mvsk_candidate_worker(c1):
+    R_train, mu, base_c2, base_c3, base_c4, method, mode, max_iter = _MVSK_WORKER_CONTEXT
+    coeffs = (float(c1), base_c2, base_c3, base_c4)
+    x, f, g, hist = optimize_with_method(
+        R_train,
+        method=method,
+        c1=coeffs[0],
+        c2=coeffs[1],
+        c3=coeffs[2],
+        c4=coeffs[3],
+        max_iter=max_iter,
+        mode=mode,
+    )
+    return (float(mu @ x), x, f, g, hist, coeffs)
+
+
+def _mvsk_target_candidates(R_train, profile='kurtosis', method='yand', mode='large', max_iter=100, c1_grid=None, n_jobs=1):
     """Precompute reusable MVSK candidates for target-return sweeps."""
     R_train = np.asarray(R_train, dtype=float)
     mu = R_train.mean(axis=0)
@@ -823,21 +850,23 @@ def _mvsk_target_candidates(R_train, profile='kurtosis', method='yand', mode='la
         c1_grid = np.geomspace(1e-4, 1e3, 10)
     _, base_c2, base_c3, base_c4 = normalized_mvsk_coefficients(R_train, profile=profile, c1=1.0)
 
-    candidates = []
-    for c1 in c1_grid:
-        coeffs = (float(c1), base_c2, base_c3, base_c4)
-        x, f, g, hist = optimize_with_method(
-            R_train,
-            method=method,
-            c1=coeffs[0],
-            c2=coeffs[1],
-            c3=coeffs[2],
-            c4=coeffs[3],
-            max_iter=max_iter,
-            mode=mode,
-        )
-        candidates.append((float(mu @ x), x, f, g, hist, coeffs))
-    return candidates
+    c1_grid = [float(c1) for c1 in c1_grid]
+    n_jobs = int(n_jobs or 1)
+    _init_mvsk_worker(R_train, mu, base_c2, base_c3, base_c4, method, mode, max_iter)
+    if n_jobs <= 1 or len(c1_grid) <= 1:
+        return [_mvsk_candidate_worker(c1) for c1 in c1_grid]
+
+    if n_jobs < 0:
+        n_jobs = os.cpu_count() or 1
+    workers = min(n_jobs, len(c1_grid))
+    context = mp.get_context('fork') if hasattr(os, 'fork') else None
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=context,
+        initializer=_init_mvsk_worker,
+        initargs=(R_train, mu, base_c2, base_c3, base_c4, method, mode, max_iter),
+    ) as pool:
+        return list(tqdm(pool.map(_mvsk_candidate_worker, c1_grid), total=len(c1_grid), desc='MVSK c1 grid'))
 
 
 def _select_mvsk_candidate(candidates, target_return):
@@ -864,14 +893,14 @@ def normalized_mvsk_coefficients(R_train, profile='kurtosis', c1=1.0):
     return (c1, 1.0 / m2, 0.25 / m3, 1.0 / m4)
 
 
-def solve_mvsk_for_target(R_train, target_return, profile='kurtosis', method='yand', mode='large', max_iter=100, candidates=None):
+def solve_mvsk_for_target(R_train, target_return, profile='kurtosis', method='yand', mode='large', max_iter=100, candidates=None, n_jobs=1):
     """Calibrate c1 so MVSK in-sample return is close to the MV return floor."""
     if candidates is None:
-        candidates = _mvsk_target_candidates(R_train, profile=profile, method=method, mode=mode, max_iter=max_iter)
+        candidates = _mvsk_target_candidates(R_train, profile=profile, method=method, mode=mode, max_iter=max_iter, n_jobs=n_jobs)
     return _select_mvsk_candidate(candidates, target_return)
 
 
-def run_real_target_sweep(panel_path, q_values=(0.40, 0.50, 0.60), split_date='2024-01-01', top_n=None, profile='kurtosis', method='yand', mode='large', max_iter=100, periods_per_year=11712):
+def run_real_target_sweep(panel_path, q_values=(0.40, 0.50, 0.60), split_date='2024-01-01', top_n=None, profile='kurtosis', method='yand', mode='large', max_iter=100, periods_per_year=11712, n_jobs=1):
     """Run the paper-style MV-vs-MVSK real-data target sweep."""
     R, symbols, dates = load_return_panel(panel_path, top_n=top_n)
     split = split_by_date(R, dates, split_date=split_date)
@@ -879,7 +908,7 @@ def run_real_target_sweep(panel_path, q_values=(0.40, 0.50, 0.60), split_date='2
     _, R_test = split['test']
     mu, Sigma = _mv_problem_stats(R_train)
     market = R_test.mean(axis=1)
-    mvsk_candidates = _mvsk_target_candidates(R_train, profile=profile, method=method, mode=mode, max_iter=max_iter)
+    mvsk_candidates = _mvsk_target_candidates(R_train, profile=profile, method=method, mode=mode, max_iter=max_iter, n_jobs=n_jobs)
 
     rows = []
     for q in tqdm(q_values):
@@ -893,6 +922,7 @@ def run_real_target_sweep(panel_path, q_values=(0.40, 0.50, 0.60), split_date='2
             mode=mode,
             max_iter=max_iter,
             candidates=mvsk_candidates,
+            n_jobs=n_jobs,
         )
 
         mv_metrics = compute_real_metrics(R_test, x_mv, market=market, periods_per_year=periods_per_year)
@@ -1174,6 +1204,7 @@ def parse_args():
     parser.add_argument('--split_date', default='2024-01-01', help='Date split for --real_target_sweep.')
     parser.add_argument('--periods_per_year', type=int, default=11712, help='Annualization periods for 5-minute data.')
     parser.add_argument('--mode', choices=('auto', 'direct', 'large', 'householder'), default='auto', help='Optimizer mode.')
+    parser.add_argument('--n_jobs', type=int, default=1, help='Parallel workers for independent MVSK c1-grid optimizations. Use 1 to disable parallelism.')
     return parser.parse_args()
 
 
@@ -1232,6 +1263,7 @@ if __name__ == "__main__":
             mode=args.mode,
             max_iter=args.max_iter,
             periods_per_year=args.periods_per_year,
+            n_jobs=args.n_jobs,
         )
         summary_path = 'yand_real_target_sweep_summary.csv'
         summary.to_csv(summary_path, index=False)
