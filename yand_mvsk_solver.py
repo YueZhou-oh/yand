@@ -5,7 +5,7 @@ import time
 import akshare as ak
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize, minimize_scalar
+from scipy.optimize import OptimizeResult, minimize, minimize_scalar
 from scipy.linalg import null_space
 from scipy.sparse.linalg import LinearOperator, cg
 from tqdm import tqdm
@@ -667,16 +667,126 @@ def compute_real_metrics(R_test, x, market=None, periods_per_year=11712, cvar_al
     return out
 
 
-def solve_mv_target(R_train, target_return):
-    """Exact long-only mean-variance target portfolio via SLSQP."""
+def _solve_equality_qp(Sigma, mu, target_return=None, active=None):
+    """Dense equality-constrained minimum-variance solution on active assets."""
+    n = Sigma.shape[0]
+    if active is None:
+        active = np.ones(n, dtype=bool)
+    idx = np.flatnonzero(active)
+    k = idx.size
+    if k == 0:
+        raise np.linalg.LinAlgError('empty active set')
+
+    S = Sigma[np.ix_(idx, idx)]
+    ones = np.ones(k)
+    if target_return is None:
+        C = ones[:, None]
+        b = np.array([1.0])
+    else:
+        C = np.column_stack((ones, mu[idx]))
+        b = np.array([1.0, float(target_return)])
+
+    jitter = 0.0
+    for _ in range(5):
+        try:
+            SinvC = np.linalg.solve(S + jitter * np.eye(k), C)
+            gram = C.T @ SinvC
+            coeff = np.linalg.solve(gram, b)
+            x_active = SinvC @ coeff
+            x = np.zeros(n, dtype=float)
+            x[idx] = x_active
+            return x
+        except np.linalg.LinAlgError:
+            jitter = 1e-10 if jitter == 0.0 else jitter * 10.0
+
+    SinvC = np.linalg.lstsq(S + jitter * np.eye(k), C, rcond=None)[0]
+    coeff = np.linalg.lstsq(C.T @ SinvC, b, rcond=None)[0]
+    x = np.zeros(n, dtype=float)
+    x[idx] = SinvC @ coeff
+    return x
+
+
+def _long_only_equality_active_set(Sigma, mu, target_return=None, tol=1e-10, max_iter=None):
+    """Active-set solve for long-only minimum variance with equality constraints."""
+    n = Sigma.shape[0]
+    if max_iter is None:
+        max_iter = 3 * n + 10
+
+    active = np.ones(n, dtype=bool)
+    for _ in range(max_iter):
+        x = _solve_equality_qp(Sigma, mu, target_return=target_return, active=active)
+        active_idx = np.flatnonzero(active)
+        if np.any(x[active] < -tol):
+            active[active_idx[np.argmin(x[active])]] = False
+            if active.sum() == 0:
+                break
+            continue
+
+        grad = 2.0 * (Sigma @ x)
+        if target_return is None:
+            C_active = np.ones((active_idx.size, 1))
+            C_all = np.ones((n, 1))
+        else:
+            C_active = np.column_stack((np.ones(active_idx.size), mu[active_idx]))
+            C_all = np.column_stack((np.ones(n), mu))
+        lam = np.linalg.lstsq(C_active, -grad[active], rcond=None)[0]
+        reduced_grad = grad + C_all @ lam
+        inactive = ~active
+        if not np.any(inactive) or np.min(reduced_grad[inactive]) >= -1e-8:
+            x[x < 0.0] = 0.0
+            s = float(x.sum())
+            if s > 0.0:
+                x /= s
+            return x
+
+        inactive_idx = np.flatnonzero(inactive)
+        active[inactive_idx[np.argmin(reduced_grad[inactive])]] = True
+
+    raise np.linalg.LinAlgError('active-set equality solver did not converge')
+
+
+def _long_only_markowitz_active_set(Sigma, mu, target_return, tol=1e-10, max_iter=None):
+    """Fast active-set solver for long-only target mean-variance portfolios."""
+    target = float(target_return)
+    max_mu = float(np.max(mu))
+    if target > max_mu + 1e-12:
+        x = np.zeros(Sigma.shape[0], dtype=float)
+        x[int(np.argmax(mu))] = 1.0
+        return x, False, 'target_return is above the long-only feasible range'
+
+    x = _long_only_equality_active_set(Sigma, mu, tol=tol, max_iter=max_iter)
+    if float(mu @ x) >= target - 1e-9:
+        return x, True, 'active-set minimum-variance solution'
+
+    x = _long_only_equality_active_set(Sigma, mu, target_return=target, tol=tol, max_iter=max_iter)
+    return x, True, 'active-set target-return solution'
+
+
+def _mv_problem_stats(R_train):
     R_train = np.asarray(R_train, dtype=float)
-    n = R_train.shape[1]
     mu = R_train.mean(axis=0)
     A = R_train - mu[None, :]
     Sigma = (A.T @ A) / max(1, R_train.shape[0])
-    Sigma = 0.5 * (Sigma + Sigma.T) + 1e-10 * np.eye(n)
-    x0 = np.full(n, 1.0 / n)
+    Sigma = 0.5 * (Sigma + Sigma.T) + 1e-10 * np.eye(R_train.shape[1])
+    return mu, Sigma
 
+
+def _solve_mv_target_from_stats(mu, Sigma, target_return):
+    n = len(mu)
+    try:
+        x, success, message = _long_only_markowitz_active_set(Sigma, mu, target_return)
+        res = OptimizeResult(
+            x=x,
+            success=bool(success),
+            message=message,
+            fun=float(x @ Sigma @ x),
+            nit=0,
+        )
+        return x, res
+    except (np.linalg.LinAlgError, FloatingPointError, ValueError):
+        pass
+
+    x0 = np.full(n, 1.0 / n)
     cons = (
         {'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0, 'jac': lambda x: np.ones(n)},
         {'type': 'ineq', 'fun': lambda x: mu @ x - target_return, 'jac': lambda x: mu},
@@ -692,6 +802,48 @@ def solve_mv_target(R_train, target_return):
         options={'maxiter': 500, 'ftol': 1e-12, 'disp': False},
     )
     return project_to_simplex(res.x), res
+
+
+def solve_mv_target(R_train, target_return):
+    """Exact long-only mean-variance target portfolio.
+
+    The common case is handled by a dense active-set Markowitz solve, which is
+    much faster than repeatedly invoking SLSQP in target sweeps. SLSQP remains
+    as a robustness fallback for pathological numerical cases.
+    """
+    mu, Sigma = _mv_problem_stats(R_train)
+    return _solve_mv_target_from_stats(mu, Sigma, target_return)
+
+
+def _mvsk_target_candidates(R_train, profile='kurtosis', method='yand', mode='large', max_iter=100, c1_grid=None):
+    """Precompute reusable MVSK candidates for target-return sweeps."""
+    R_train = np.asarray(R_train, dtype=float)
+    mu = R_train.mean(axis=0)
+    if c1_grid is None:
+        c1_grid = np.geomspace(1e-4, 1e3, 10)
+    _, base_c2, base_c3, base_c4 = normalized_mvsk_coefficients(R_train, profile=profile, c1=1.0)
+
+    candidates = []
+    for c1 in c1_grid:
+        coeffs = (float(c1), base_c2, base_c3, base_c4)
+        x, f, g, hist = optimize_with_method(
+            R_train,
+            method=method,
+            c1=coeffs[0],
+            c2=coeffs[1],
+            c3=coeffs[2],
+            c4=coeffs[3],
+            max_iter=max_iter,
+            mode=mode,
+        )
+        candidates.append((float(mu @ x), x, f, g, hist, coeffs))
+    return candidates
+
+
+def _select_mvsk_candidate(candidates, target_return):
+    best = min(candidates, key=lambda cand: abs(cand[0] - target_return))
+    ret, x, f, g, hist, coeffs = best
+    return x, f, g, hist, coeffs, ret
 
 
 def normalized_mvsk_coefficients(R_train, profile='kurtosis', c1=1.0):
@@ -712,21 +864,11 @@ def normalized_mvsk_coefficients(R_train, profile='kurtosis', c1=1.0):
     return (c1, 1.0 / m2, 0.25 / m3, 1.0 / m4)
 
 
-def solve_mvsk_for_target(R_train, target_return, profile='kurtosis', method='yand', mode='large', max_iter=100):
+def solve_mvsk_for_target(R_train, target_return, profile='kurtosis', method='yand', mode='large', max_iter=100, candidates=None):
     """Calibrate c1 so MVSK in-sample return is close to the MV return floor."""
-    mu = R_train.mean(axis=0)
-    c1_grid = np.geomspace(1e-4, 1e3, 10)
-    best = None
-    for c1 in c1_grid:
-        coeffs = normalized_mvsk_coefficients(R_train, profile=profile, c1=c1)
-        x, f, g, hist = optimize_with_method(R_train, method=method, c1=coeffs[0], c2=coeffs[1], c3=coeffs[2], c4=coeffs[3], max_iter=max_iter, mode=mode)
-        ret = float(mu @ x)
-        score = abs(ret - target_return)
-        cand = (score, x, f, g, hist, coeffs, ret)
-        if best is None or score < best[0]:
-            best = cand
-    _, x, f, g, hist, coeffs, ret = best
-    return x, f, g, hist, coeffs, ret
+    if candidates is None:
+        candidates = _mvsk_target_candidates(R_train, profile=profile, method=method, mode=mode, max_iter=max_iter)
+    return _select_mvsk_candidate(candidates, target_return)
 
 
 def run_real_target_sweep(panel_path, q_values=(0.40, 0.50, 0.60), split_date='2024-01-01', top_n=None, profile='kurtosis', method='yand', mode='large', max_iter=100, periods_per_year=11712):
@@ -735,14 +877,23 @@ def run_real_target_sweep(panel_path, q_values=(0.40, 0.50, 0.60), split_date='2
     split = split_by_date(R, dates, split_date=split_date)
     _, R_train = split['train']
     _, R_test = split['test']
-    mu = R_train.mean(axis=0)
+    mu, Sigma = _mv_problem_stats(R_train)
     market = R_test.mean(axis=1)
+    mvsk_candidates = _mvsk_target_candidates(R_train, profile=profile, method=method, mode=mode, max_iter=max_iter)
 
     rows = []
     for q in tqdm(q_values):
         target = float(np.quantile(mu, q))
-        x_mv, mv_res = solve_mv_target(R_train, target)
-        x_mvsk, f, g, hist, coeffs, mvsk_train_ret = solve_mvsk_for_target(R_train, target, profile=profile, method=method, mode=mode, max_iter=max_iter)
+        x_mv, mv_res = _solve_mv_target_from_stats(mu, Sigma, target)
+        x_mvsk, f, g, hist, coeffs, mvsk_train_ret = solve_mvsk_for_target(
+            R_train,
+            target,
+            profile=profile,
+            method=method,
+            mode=mode,
+            max_iter=max_iter,
+            candidates=mvsk_candidates,
+        )
 
         mv_metrics = compute_real_metrics(R_test, x_mv, market=market, periods_per_year=periods_per_year)
         mvsk_metrics = compute_real_metrics(R_test, x_mvsk, market=market, periods_per_year=periods_per_year)
